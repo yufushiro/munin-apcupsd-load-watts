@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+import unittest
+
+APCACCESS_PATH = '/sbin/apcaccess'
+
+class ApcupsdStatus:
+    _inner: dict[str, str]
+
+    def __init__(self, innerDict: dict[str, str]) -> None:
+        self._inner = innerDict
+
+    def get(self, key: str) -> str:
+        if key in self._inner:
+            return self._inner[key]
+        raise RuntimeError(f'UPS does not provide "{key}" value')
+
+    def get_float(self, key: str, expect_unit: str) -> float:
+        value_with_unit = self.get(key)
+        match value_with_unit.rsplit(' ', maxsplit=1):
+            case (value_str, unit) if unit == expect_unit:
+                return float(value_str)
+        raise RuntimeError(f'The value must end with "{expect_unit}": {value_with_unit}')
+
+    @staticmethod
+    def load_from(contents: str) -> 'ApcupsdStatus':
+        innerDict: dict[str, str] = {}
+        for line in contents.splitlines():
+            if line.strip() == '':
+                continue
+            match line.split(': ', maxsplit=1):
+                case [key, value]:
+                    innerDict[key.rstrip()] = value.rstrip()
+                case _:
+                    raise RuntimeError(f'Parse error: "{line}"')
+        return ApcupsdStatus(innerDict)
+
+def calc_load_watts(status: ApcupsdStatus) -> float:
+    nom_power = status.get_float('NOMPOWER', 'Watts')
+    load_pct = status.get_float('LOADPCT', 'Percent')
+    return nom_power * load_pct / 100.0
+
+def print_config() -> None:
+    print('graph_title UPS Load')
+    print('graph_args --base 1000 -l 0')
+    print('graph_vlabel Watts')
+    print('graph_scale no')
+    print('graph_category sensors')
+    print('load.label load')
+    print('load.info UPS load in Watts.')
+
+def print_values() -> None:
+    process = subprocess.run(APCACCESS_PATH, capture_output=True, text=True)
+    if process.returncode != 0:
+        raise RuntimeError(f'Failed to run apcaccess with exit code {process.returncode}')
+    status = ApcupsdStatus.load_from(process.stdout)
+    load_watts = calc_load_watts(status)
+    print(f'load.value {load_watts:.2f}')
+
+def main(argv: list[str]) -> None:
+    if len(argv) >= 2 and argv[1] == 'config':
+        print_config()
+    else:
+        print_values()
+
+if __name__ == '__main__':
+    main(sys.argv)
+
+class TestApcupsdStatus(unittest.TestCase):
+    def test_parse_status_with_whitespace(self) -> None:
+        status = ApcupsdStatus.load_from(
+            'DATE     : 2022-01-01 00:00:00 +0900  \n'
+            'STATUS   : ONLINE \n'
+        )
+        self.assertEqual(status.get('STATUS'), 'ONLINE')
+
+    def test_invalid_status_line(self) -> None:
+        with self.assertRaises(RuntimeError):
+            ApcupsdStatus.load_from('INVALID_LINE\n')
+
+    def test_get_float(self) -> None:
+        status = ApcupsdStatus.load_from(
+            'LOADPCT  : 10.0 Percent\n'
+        )
+        self.assertEqual(status.get_float('LOADPCT', 'Percent'), 10.0)
+
+    def test_get_float_invalid_unit(self) -> None:
+        status = ApcupsdStatus.load_from(
+            'LOADPCT  : 10.0 Percent\n'
+        )
+        with self.assertRaises(RuntimeError):
+            status.get_float('LOADPCT', 'Seconds')
+
+    def test_calc_load_watts(self) -> None:
+        status = ApcupsdStatus.load_from(
+            'LOADPCT  : 10.0 Percent\n'
+            'NOMPOWER : 330 Watts\n'
+        )
+        result = calc_load_watts(status)
+        self.assertEqual(result, 33.0)
